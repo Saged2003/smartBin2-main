@@ -5,75 +5,47 @@
 #include "DisplayManager.h"
 #include "S3AppController.h"
 
-// إعدادات الشبكة القياسية وسيرفر السيرفر الفعلي
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const char* mqtt_server = "192.168.1.100"; // قم بتغييره إلى IP جهاز الكمبيوتر الذي يعمل عليه السيرفر
-const char* bin_id = "BIN_01";             // معرّف السلة الثابت المطابق لقاعدة البيانات
-
-WiFiClient espClient;
-PubSubClient client(espClient);
-
 DisplayManager display;
 S3AppController app;
 
-void setup_wifi() {
-    delay(10);
-    display.showMessage("Connecting WiFi...");
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    display.showMessage("WiFi Connected!");
-    Serial.println("\nWiFi Connected!");
-}
+// --- إعدادات الشبكة والسيرفر (قم بتغييرها بما يناسبك) ---
+const char* ssid = "YOUR_WIFI_SSID";         // اكتب اسم شبكة الواي فاي
+const char* password = "YOUR_WIFI_PASSWORD"; // اكتب كلمة المرور
+const char* mqtt_server = "192.168.1.xxx";   // اكتب الـ IP الخاص بجهاز الكمبيوتر الذي يعمل عليه الباك إند
 
+String BIN_ID = "BIN_001";                   // يجب أن يطابق الـ bin_id المسجل في الداتا بيز
+String HARDWARE_TOKEN = "TOKEN_12345";       // التوكن الخاص بالسلة لحمايتها
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+bool needsNewQR = true;
+unsigned long lastQRRequestTime = 0;
+
+// --- استقبال أوامر السيرفر (MQTT) ---
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
     String message = "";
-    for (unsigned int i = 0; i < length; i++) {
+    for (int i = 0; i < length; i++) {
         message += (char)payload[i];
     }
-    
-    String currentTopic = String(topic);
-    
-    // استقبال أمر تفعيل السلة القادم من الموبايل عبر السيرفر
-    if (currentTopic == "smartbin/" + String(bin_id) + "/command") {
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, message);
-        if (!error) {
-            String cmd = doc["cmd"];
-            if (cmd == "START_BIN") {
-                app.receiveBackendCommand("START_BIN");
-            }
-        }
-    }
-    // استقبال كود الـ QR المتغير من الباك إند وعرضه فوراً
-    else if (currentTopic == "smartbin/" + String(bin_id) + "/qr_code") {
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, message);
-        if (!error) {
-            String qrCode = doc["code"];
-            app.receiveBackendCommand("QR:" + qrCode);
-        }
-    }
-}
+    String topicStr = String(topic);
 
-void reconnect() {
-    while (!client.connected()) {
-        Serial.print("Attempting MQTT connection...");
-        if (client.connect(bin_id)) {
-            Serial.println("connected");
-            client.subscribe(("smartbin/" + String(bin_id) + "/command").c_str());
-            client.subscribe(("smartbin/" + String(bin_id) + "/qr_code").c_str());
-            
-            // طلب كود QR جديد للمستخدم فور بدء الاتصال بالسيرفر
-            client.publish(("smartbin/" + String(bin_id) + "/request_qr").c_str(), "{}");
-        } else {
-            Serial.print("failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" try again in 5 seconds");
-            delay(5000);
+    // إذا استقبلنا QR جديد من السيرفر
+    if (topicStr.endsWith("/qr_code")) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, message);
+        if (!error) {
+            String code = doc["code"].as<String>();
+            app.receiveBackendCommand("QR:" + code);
+            needsNewQR = false; // استلمنا الكود بنجاح
+        }
+    }
+    // إذا استقبلنا أمر التشغيل (المستخدم قام بعمل مسح للـ QR)
+    else if (topicStr.endsWith("/command")) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, message);
+        if (!error && doc["cmd"] == "START_BIN") {
+            app.receiveBackendCommand("START_BIN");
         }
     }
 }
@@ -83,62 +55,52 @@ void setup() {
     display.init();
     app.init();
     
-    setup_wifi();
-    client.setServer(mqtt_server, 1883);
-    client.setCallback(mqttCallback);
+    // الاتصال بالواي فاي
+    display.showMessage("Connecting WiFi...");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+    }
+    
+    // إعداد الـ MQTT
+    mqttClient.setServer(mqtt_server, 1883);
+    mqttClient.setCallback(mqttCallback);
+}
+
+void reconnect() {
+    if (!mqttClient.connected()) {
+        display.showMessage("Connecting MQTT...");
+        if (mqttClient.connect(BIN_ID.c_str())) {
+            // الاشتراك في قنوات السلة
+            mqttClient.subscribe(("smartbin/" + BIN_ID + "/qr_code").c_str());
+            mqttClient.subscribe(("smartbin/" + BIN_ID + "/command").c_str());
+            
+            // مسح الشاشة بعد الاتصال للعودة للحالة الطبيعية
+            display.tft.fillScreen(ST77XX_BLACK);
+        } else {
+            delay(5000);
+        }
+    }
 }
 
 void loop() {
-    if (!client.connected()) {
+    if (!mqttClient.connected()) {
         reconnect();
+    } else {
+        mqttClient.loop();
     }
-    client.loop();
-    app.run();
     
-    // معالجة البيانات المستقبلة من البوردة السفلية (الحساسات والمحركات) عبر السيريال وتحويلها فورا للباك إند
-    if (Serial1.available()) {
-        String incomingData = Serial1.readStringUntil('\n');
-        incomingData.trim();
-        
-        if (incomingData.length() > 0) {
-            JsonDocument doc;
-            DeserializationError error = deserializeJson(doc, incomingData);
-            
-            if (!error) {
-                String req = doc["req"];
-                if (req == "update") {
-                    float pLvl = doc["pLvl"];
-                    float mLvl = doc["mLvl"];
-                    float calculatedCapacity = (pLvl > mLvl) ? pLvl : mLvl; // اعتماد القياس الأعلى لامتلاء الحجرات
-                    
-                    JsonDocument outDoc;
-                    outDoc["bin_id"] = bin_id;
-                    outDoc["hardware_token"] = "HW_TOKEN_01";
-                    outDoc["capacity"] = calculatedCapacity;
-                    
-                    String payloadStr;
-                    serializeJson(outDoc, payloadStr);
-                    client.publish(("smartbin/" + String(bin_id) + "/update").c_str(), payloadStr.c_str());
-                } 
-                else if (req == "end") {
-                    int points = doc["pts"];
-                    float totalWeight = (float)doc["pWt"] + (float)doc["mWt"]; // جمع الأوزان المدخلة
-                    
-                    JsonDocument outDoc;
-                    outDoc["bin_id"] = bin_id;
-                    outDoc["hardware_token"] = "HW_TOKEN_01";
-                    outDoc["points"] = points;
-                    outDoc["weight"] = totalWeight;
-                    
-                    String payloadStr;
-                    serializeJson(outDoc, payloadStr);
-                    client.publish(("smartbin/" + String(bin_id) + "/session_end").c_str(), payloadStr.c_str());
-                    
-                    // توليد كود QR جديد تلقائياً بعد مرور 3 ثوانٍ لتجهيز السلة للمستخدم القادم
-                    delay(3000);
-                    client.publish(("smartbin/" + String(bin_id) + "/request_qr").c_str(), "{}");
-                }
-            }
+    // تشغيل اللوجيك الأساسي للسيستم
+    app.run();
+
+    // طلب QR Code جديد إذا كانت السلة فارغة وتحتاج لكود جديد
+    if (mqttClient.connected() && app.isIdle() && needsNewQR) {
+        unsigned long now = millis();
+        if (now - lastQRRequestTime > 5000) { // تأخير 5 ثواني بين الطلبات لتجنب الضغط
+            String reqTopic = "smartbin/" + BIN_ID + "/request_qr";
+            String payload = "{\"hardware_token\":\"" + HARDWARE_TOKEN + "\"}";
+            mqttClient.publish(reqTopic.c_str(), payload.c_str());
+            lastQRRequestTime = now;
         }
     }
 }

@@ -18,6 +18,7 @@ private:
     S3State currentState;
     unsigned long cooldownStartTime;
     int earnedPoints;
+    float lastTotalWeight; // متغير جديد لحفظ الوزن الكلي وإرساله للسيرفر
     
     // شاشات العرض
     void drawSessionScreen();
